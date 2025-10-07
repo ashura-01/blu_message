@@ -1,207 +1,209 @@
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // for orientation lock
 import 'package:nearby_connections/nearby_connections.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setPreferredOrientations([
-    DeviceOrientation.portraitUp, // lock portrait only
-  ]).then((_) {
-    runApp(const MyApp());
-  });
-}
-
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class BluMessenger extends StatefulWidget {
+  const BluMessenger({super.key});
 
   @override
-  Widget build(BuildContext context) => const MaterialApp(
-        debugShowCheckedModeBanner: false,
-        home: NearbyChatApp(),
-      );
+  State<BluMessenger> createState() => _BluMessengerState();
 }
 
-class NearbyChatApp extends StatefulWidget {
-  const NearbyChatApp({super.key});
+class _BluMessengerState extends State<BluMessenger> {
+  final Strategy strategy = Strategy.P2P_STAR;
 
-  @override
-  State<NearbyChatApp> createState() => _NearbyChatAppState();
-}
-
-class _NearbyChatAppState extends State<NearbyChatApp> {
-  final Strategy strategy = Strategy.P2P_CLUSTER;
-  final TextEditingController _controller = TextEditingController();
-  final ScrollController _scrollController = ScrollController();
-
-  final List<String> messages = [];
-  final Map<String, String> discoveredDevices = {};
+  String deviceName = '';
   String? connectedId;
-  String? connectedName;
+  String? connectedDeviceName;
+
+  bool isAdvertising = false;
   bool isDiscovering = false;
+
+  List<Endpoint> discoveredDevices = [];
+  List<String> messages = [];
+  final TextEditingController _controller = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    _initializeNearby();
+    deviceName =
+        Platform.localHostname.isNotEmpty
+            ? 'Device_${Platform.localHostname}'
+            : 'Device_${DateTime.now().millisecondsSinceEpoch}';
   }
 
-  Future<void> _initializeNearby() async {
+  Future<void> _requestPermissions() async {
     await [
       Permission.bluetooth,
       Permission.bluetoothAdvertise,
       Permission.bluetoothConnect,
-      Permission.location
+      Permission.bluetoothScan,
+      Permission.location,
+      Permission.nearbyWifiDevices,
     ].request();
-
-    _startAdvertising();
-    _startDiscovery();
   }
 
-  Future<void> _startAdvertising() async {
+  Future<void> startAdvertising() async {
+    await _requestPermissions();
     try {
       await Nearby().startAdvertising(
-        'User',
+        deviceName,
         strategy,
         onConnectionInitiated: _onConnectionInit,
         onConnectionResult: (id, status) {
-          if (status == Status.CONNECTED) {
+          if (status == Status.CONNECTED && mounted) {
+            setState(() => connectedId = id);
+          }
+        },
+        onDisconnected: (id) {
+          if (mounted) {
+            setState(() {
+              connectedId = null;
+              connectedDeviceName = null;
+            });
+          }
+        },
+      );
+      setState(() => isAdvertising = true);
+    } catch (e) {
+      print('Advertising Error: $e');
+    }
+  }
+
+  Future<void> stopAdvertising() async {
+    await Nearby().stopAdvertising();
+    setState(() => isAdvertising = false);
+  }
+
+  Future<void> startDiscovery() async {
+    await _requestPermissions();
+    discoveredDevices.clear();
+    try {
+      await Nearby().startDiscovery(
+        deviceName,
+        strategy,
+        onEndpointFound: (id, name, serviceId) {
+          if (!discoveredDevices.any((e) => e.id == id)) {
+            setState(() {
+              discoveredDevices.add(Endpoint(id: id, name: name));
+            });
+          }
+        },
+        onEndpointLost: (id) {
+          setState(() {
+            discoveredDevices.removeWhere((e) => e.id == id);
+          });
+        },
+      );
+      setState(() => isDiscovering = true);
+    } catch (e) {
+      print('Discovery Error: $e');
+    }
+  }
+
+  Future<void> stopDiscovery() async {
+    await Nearby().stopDiscovery();
+    setState(() => isDiscovering = false);
+  }
+
+  void _onConnectionInit(String id, ConnectionInfo info) {
+    setState(() => connectedDeviceName = info.endpointName);
+
+    Nearby().acceptConnection(
+      id,
+      onPayLoadRecieved: (endid, payload) {
+        if (payload.type == PayloadType.BYTES) {
+          String msg = String.fromCharCodes(payload.bytes!);
+          setState(() {
+            messages.add("🟢 ${connectedDeviceName ?? 'Friend'}: $msg");
+          });
+        }
+      },
+      onPayloadTransferUpdate: (endid, update) {},
+    );
+  }
+
+  Future<void> connectToDevice(Endpoint device) async {
+    try {
+      await Nearby().requestConnection(
+        deviceName,
+        device.id,
+        onConnectionInitiated: _onConnectionInit,
+        onConnectionResult: (id, status) {
+          if (status == Status.CONNECTED && mounted) {
             setState(() => connectedId = id);
           }
         },
         onDisconnected: (id) {
           setState(() {
             connectedId = null;
-            connectedName = null;
+            connectedDeviceName = null;
           });
         },
       );
     } catch (e) {
-      debugPrint("Error starting advertising: $e");
+      print('Connection Error: $e');
     }
   }
 
-  Future<void> _startDiscovery() async {
-    if (isDiscovering) return;
-    setState(() => isDiscovering = true);
-
-    discoveredDevices.clear();
-    try {
-      await Nearby().startDiscovery(
-        'User',
-        strategy,
-        onEndpointFound: (id, name, _) {
-          setState(() {
-            discoveredDevices[id] = name;
-          });
-        },
-        onEndpointLost: (id) {
-          setState(() {
-            discoveredDevices.remove(id);
-          });
-        },
-      );
-    } catch (e) {
-      debugPrint("Discovery failed: $e");
+  void _sendMessage(String msg) async {
+    if (connectedId != null && msg.isNotEmpty) {
+      try {
+        await Nearby().sendBytesPayload(
+          connectedId!,
+          Uint8List.fromList(msg.codeUnits),
+        );
+        setState(() => messages.add("🔵 Me: $msg"));
+      } catch (e) {
+        print('Send Message Error: $e');
+      }
     }
   }
 
-  void _rescanDevices() async {
-    setState(() {
-      discoveredDevices.clear();
-      isDiscovering = false;
-    });
-    await Nearby().stopDiscovery();
-    _startDiscovery();
-  }
-
-  void _onConnectionInit(String id, ConnectionInfo info) {
-    Nearby().acceptConnection(
-      id,
-      onPayLoadRecieved: (endid, payload) {
-        if (payload.type == PayloadType.BYTES) {
-          String msg = String.fromCharCodes(payload.bytes!);
-          setState(() => messages.add("🟢 ${info.endpointName}: $msg"));
-          WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
-        }
-      },
-      onPayloadTransferUpdate: (endid, update) {},
-    );
-    setState(() {
-      connectedId = id;
-      connectedName = info.endpointName;
-    });
-  }
-
-  void _connectToDevice(String id) {
-    Nearby().requestConnection(
-      'User',
-      id,
-      onConnectionInitiated: _onConnectionInit,
-      onConnectionResult: (id, status) {
-        if (status == Status.CONNECTED) {
-          setState(() => connectedId = id);
-        }
-      },
-      onDisconnected: (id) {
-        setState(() {
-          connectedId = null;
-          connectedName = null;
-        });
-      },
-    );
-  }
-
-  void _sendMessage() {
-    final msg = _controller.text.trim();
-    if (msg.isNotEmpty && connectedId != null) {
-      final bytes = Uint8List.fromList(msg.codeUnits);
-      Nearby().sendBytesPayload(connectedId!, bytes);
-      setState(() {
-        messages.add(msg);  // Sender's message without icon or "Me"
-      });
-      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
-      _controller.clear();
-    }
-  }
-
-  void _showDeviceList() {
-    if (discoveredDevices.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("No nearby devices found")),
-      );
-      return;
-    }
-
-    showModalBottomSheet(
+  void _showDeviceSelectionDialog() {
+    showDialog(
       context: context,
-      builder: (context) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: discoveredDevices.entries
-            .map(
-              (entry) => ListTile(
-                title: Text(entry.value),
-                subtitle: Text(entry.key),
-                onTap: () {
-                  Navigator.pop(context);
-                  _connectToDevice(entry.key);
-                },
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: Colors.black,
+          title: const Text(
+            "Select a Device",
+            style: TextStyle(color: Colors.white),
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: discoveredDevices.length,
+              itemBuilder: (context, index) {
+                final device = discoveredDevices[index];
+                return ListTile(
+                  title: Text(
+                    device.name,
+                    style: const TextStyle(color: Colors.green),
+                  ),
+                  onTap: () {
+                    Navigator.pop(context);
+                    connectToDevice(device);
+                  },
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text(
+                "Cancel",
+                style: TextStyle(color: Colors.white),
               ),
-            )
-            .toList(),
-      ),
+            ),
+          ],
+        );
+      },
     );
-  }
-
-  void _scrollToBottom() {
-    if (_scrollController.hasClients) {
-      _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOut,
-      );
-    }
   }
 
   @override
@@ -210,94 +212,107 @@ class _NearbyChatAppState extends State<NearbyChatApp> {
     Nearby().stopAdvertising();
     Nearby().stopDiscovery();
     Nearby().stopAllEndpoints();
-    _scrollController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color.fromARGB(255, 46, 48, 56),
       appBar: AppBar(
-        foregroundColor: const Color.fromARGB(255, 160, 195, 255),
-        backgroundColor: const Color.fromARGB(255, 24, 27, 43),
-        title: Text(
-          connectedName != null ? "Chat with $connectedName" : "Blue",
-          style: const TextStyle(fontSize: 16),
-        ),
+        title: const Text("Blu Messenger"),
+        backgroundColor: const Color.fromARGB(255, 0, 12, 53),
+        foregroundColor: Colors.white,
         actions: [
           IconButton(
-            icon: const Icon(Icons.devices),
-            onPressed: _showDeviceList,
+            icon: Icon(isAdvertising ? Icons.stop : Icons.campaign),
+            tooltip: isAdvertising ? 'Stop Advertising' : 'Start Advertising',
+            onPressed:
+                () => isAdvertising ? stopAdvertising() : startAdvertising(),
           ),
           IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _rescanDevices,
+            icon: Icon(isDiscovering ? Icons.stop_circle : Icons.search),
+            tooltip: isDiscovering ? 'Stop Discovery' : 'Start Discovery',
+            onPressed: () => isDiscovering ? stopDiscovery() : startDiscovery(),
           ),
         ],
       ),
       body: Column(
         children: [
+          if (connectedDeviceName != null)
+            Container(
+              width: double.infinity,
+              color: Colors.black12,
+              padding: const EdgeInsets.all(12),
+              child: Text(
+                "🔗 Connected to: $connectedDeviceName",
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.green,
+                ),
+              ),
+            ),
+          if (connectedId == null && discoveredDevices.isNotEmpty)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color.fromARGB(255, 0, 12, 53),
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(200, 50),
+                  ),
+                  onPressed: _showDeviceSelectionDialog,
+                  child: const Text("Select Device"),
+                ),
+              ),
+            ),
           Expanded(
             child: ListView.builder(
-              controller: _scrollController,
               itemCount: messages.length,
-              itemBuilder: (context, i) {
-                final isMe = !messages[i].startsWith("🟢"); // If no green icon, it's sender
-                return Align(
-                  alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+              padding: const EdgeInsets.all(10),
+              itemBuilder: (_, i) {
+                return Container(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  alignment:
+                      messages[i].startsWith("🔵")
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
                   child: Container(
-                    margin:
-                        const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                    padding: const EdgeInsets.all(12),
+                    padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
-                      color: isMe
-                          ? const Color.fromARGB(255, 30, 37, 53)
-                          : const Color.fromARGB(255, 68, 77, 107),
-                      borderRadius: BorderRadius.circular(15),
+                      color:
+                          messages[i].startsWith("🔵")
+                              ? Colors.blue[100]
+                              : Colors.green[100],
+                      borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
-                      // Remove icon from sender message display
-                      isMe ? messages[i] : messages[i].substring(2),
-                      style: const TextStyle(color: Colors.white, fontSize: 16),
+                      messages[i].replaceFirst(RegExp(r'^🔵 |^🟢 '), ''),
                     ),
                   ),
                 );
               },
             ),
           ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-            color: const Color.fromARGB(255, 24, 27, 43),
+          Padding(
+            padding: const EdgeInsets.all(8.0),
             child: Row(
               children: [
                 Expanded(
                   child: TextField(
                     controller: _controller,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: InputDecoration(
-                      hintText: "Type a message...",
-                      hintStyle: const TextStyle(color: Colors.white60),
-                      enabledBorder: OutlineInputBorder(
-                        borderSide: const BorderSide(
-                            color: Color.fromARGB(255, 160, 195, 255)),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderSide: const BorderSide(
-                            color: Color.fromARGB(255, 160, 195, 255)),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 10),
+                    decoration: const InputDecoration(
+                      hintText: "Enter message",
+                      border: OutlineInputBorder(),
                     ),
                   ),
                 ),
-                const SizedBox(width: 8),
                 IconButton(
-                  icon: const Icon(Icons.send,
-                      color: Color.fromARGB(255, 160, 195, 255)),
-                  onPressed: _sendMessage,
+                  icon: const Icon(Icons.send),
+                  onPressed: () {
+                    _sendMessage(_controller.text.trim());
+                    _controller.clear();
+                  },
                 ),
               ],
             ),
@@ -308,288 +323,9 @@ class _NearbyChatAppState extends State<NearbyChatApp> {
   }
 }
 
+class Endpoint {
+  final String id;
+  final String name;
 
-
-
-// import 'dart:typed_data';
-// import 'package:flutter/material.dart';
-// import 'package:nearby_connections/nearby_connections.dart';
-// import 'package:permission_handler/permission_handler.dart';
-
-// void main() => runApp(const MyApp());
-
-// class MyApp extends StatelessWidget {
-//   const MyApp({super.key});
-
-//   @override
-//   Widget build(BuildContext context) => const MaterialApp(
-//         debugShowCheckedModeBanner: false,
-//         home: NearbyChatApp(),
-//       );
-// }
-
-// class NearbyChatApp extends StatefulWidget {
-//   const NearbyChatApp({super.key});
-
-//   @override
-//   State<NearbyChatApp> createState() => _NearbyChatAppState();
-// }
-
-// class _NearbyChatAppState extends State<NearbyChatApp> {
-//   final Strategy strategy = Strategy.P2P_CLUSTER;
-//   final TextEditingController _controller = TextEditingController();
-//   final List<String> messages = [];
-//   final Map<String, String> discoveredDevices = {};
-//   String? connectedId;
-//   String? connectedName;
-//   bool isDiscovering = false;
-
-//   @override
-//   void initState() {
-//     super.initState();
-//     _initializeNearby();
-//   }
-
-//   Future<void> _initializeNearby() async {
-//     await [
-//       Permission.bluetooth,
-//       Permission.bluetoothAdvertise,
-//       Permission.bluetoothConnect,
-//       Permission.location
-//     ].request();
-
-//     _startAdvertising();
-//     _startDiscovery();
-//   }
-
-//   Future<void> _startAdvertising() async {
-//     try {
-//       await Nearby().startAdvertising(
-//         'User',
-//         strategy,
-//         onConnectionInitiated: _onConnectionInit,
-//         onConnectionResult: (id, status) {
-//           if (status == Status.CONNECTED) {
-//             setState(() => connectedId = id);
-//           }
-//         },
-//         onDisconnected: (id) {
-//           setState(() {
-//             connectedId = null;
-//             connectedName = null;
-//           });
-//         },
-//       );
-//     } catch (e) {
-//       debugPrint("Error starting advertising: $e");
-//     }
-//   }
-
-//   Future<void> _startDiscovery() async {
-//     if (isDiscovering) return;
-//     setState(() => isDiscovering = true);
-
-//     discoveredDevices.clear();
-//     try {
-//       await Nearby().startDiscovery(
-//         'User',
-//         strategy,
-//         onEndpointFound: (id, name, _) {
-//           setState(() {
-//             discoveredDevices[id] = name;
-//           });
-//         },
-//         onEndpointLost: (id) {
-//           setState(() {
-//             discoveredDevices.remove(id);
-//           });
-//         },
-//       );
-//     } catch (e) {
-//       debugPrint("Discovery failed: $e");
-//     }
-//   }
-
-//   void _rescanDevices() async {
-//     setState(() {
-//       discoveredDevices.clear();
-//       isDiscovering = false;
-//     });
-//     await Nearby().stopDiscovery();
-//     _startDiscovery();
-//   }
-
-//   void _onConnectionInit(String id, ConnectionInfo info) {
-//     Nearby().acceptConnection(
-//       id,
-//       onPayLoadRecieved: (endid, payload) {
-//         if (payload.type == PayloadType.BYTES) {
-//           String msg = String.fromCharCodes(payload.bytes!);
-//           setState(() => messages.add("🟢 ${info.endpointName}: $msg"));
-//         }
-//       },
-//       onPayloadTransferUpdate: (endid, update) {},
-//     );
-//     setState(() {
-//       connectedId = id;
-//       connectedName = info.endpointName;
-//     });
-//   }
-
-//   void _connectToDevice(String id) {
-//     Nearby().requestConnection(
-//       'User',
-//       id,
-//       onConnectionInitiated: _onConnectionInit,
-//       onConnectionResult: (id, status) {
-//         if (status == Status.CONNECTED) {
-//           setState(() => connectedId = id);
-//         }
-//       },
-//       onDisconnected: (id) {
-//         setState(() {
-//           connectedId = null;
-//           connectedName = null;
-//         });
-//       },
-//     );
-//   }
-
-//   void _sendMessage() {
-//     final msg = _controller.text.trim();
-//     if (msg.isNotEmpty && connectedId != null) {
-//       final bytes = Uint8List.fromList(msg.codeUnits);
-//       Nearby().sendBytesPayload(connectedId!, bytes);
-//       setState(() => messages.add("🔵 Me: $msg"));
-//       _controller.clear();
-//     }
-//   }
-
-//   void _showDeviceList() {
-//     if (discoveredDevices.isEmpty) {
-//       ScaffoldMessenger.of(context).showSnackBar(
-//         const SnackBar(content: Text("No nearby devices found")),
-//       );
-//       return;
-//     }
-
-//     showModalBottomSheet(
-//       context: context,
-//       builder: (context) => Column(
-//         mainAxisSize: MainAxisSize.min,
-//         children: discoveredDevices.entries
-//             .map(
-//               (entry) => ListTile(
-//                 title: Text(entry.value),
-//                 subtitle: Text(entry.key),
-//                 onTap: () {
-//                   Navigator.pop(context);
-//                   _connectToDevice(entry.key);
-//                 },
-//               ),
-//             )
-//             .toList(),
-//       ),
-//     );
-//   }
-
-//   @override
-//   void dispose() {
-//     _controller.dispose();
-//     Nearby().stopAdvertising();
-//     Nearby().stopDiscovery();
-//     Nearby().stopAllEndpoints();
-//     super.dispose();
-//   }
-
-//   @override
-//   Widget build(BuildContext context) {
-//     return Scaffold(
-//       backgroundColor: const Color.fromARGB(255, 46, 48, 56),
-//       appBar: AppBar(
-//         foregroundColor: const Color.fromARGB(255, 160, 195, 255),
-//         backgroundColor: const Color.fromARGB(255, 24, 27, 43),
-//         title: Text(
-//           connectedName != null
-//               ? "Chat with $connectedName"
-//               : "Blue", style: TextStyle(fontSize: 16),
-//         ),
-//         actions: [
-//           IconButton(
-//             icon: const Icon(Icons.devices),
-//             onPressed: _showDeviceList,
-//           ),
-//           IconButton(
-//             icon: const Icon(Icons.refresh),
-//             onPressed: _rescanDevices,
-//           ),
-//         ],
-//       ),
-//       body: Column(
-//         children: [
-//           Expanded(
-//             child: ListView.builder(
-//               itemCount: messages.length,
-//               itemBuilder: (context, i) {
-//                 final isMe = messages[i].startsWith("🔵");
-//                 return Align(
-//                   alignment:
-//                       isMe ? Alignment.centerRight : Alignment.centerLeft,
-//                   child: Container(
-//                     margin:
-//                         const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-//                     padding: const EdgeInsets.all(12),
-//                     decoration: BoxDecoration(
-//                       color: isMe ?  const Color.fromARGB(255, 30, 37, 53) : const Color.fromARGB(255, 68, 77, 107),
-//                       borderRadius: BorderRadius.circular(15),
-//                     ),
-//                     child: Text(
-//                       messages[i],
-//                       style:
-//                           const TextStyle(color: Colors.white, fontSize: 16),
-//                     ),
-//                   ),
-//                 );
-//               },
-//             ),
-//           ),
-//           Container(
-//             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-//             color:  Color.fromARGB(255, 24, 27, 43),
-//             child: Row(
-//               children: [
-//                 Expanded(
-//                   child: TextField(
-//                     controller: _controller,
-//                     style: const TextStyle(color: Colors.white),
-//                     decoration: InputDecoration(
-//                       hintText: "Type a message...",
-//                       hintStyle: const TextStyle(color: Colors.white60),
-//                       enabledBorder: OutlineInputBorder(
-//                         borderSide: const BorderSide(color: const Color.fromARGB(255, 160, 195, 255)),
-//                         borderRadius: BorderRadius.circular(10),
-//                       ),
-//                       focusedBorder: OutlineInputBorder(
-//                         borderSide:
-//                             const BorderSide(color: const Color.fromARGB(255, 160, 195, 255)),
-//                         borderRadius: BorderRadius.circular(10),
-//                       ),
-//                       contentPadding: const EdgeInsets.symmetric(
-//                           horizontal: 12, vertical: 10),
-//                     ),
-//                   ),
-//                 ),
-//                 const SizedBox(width: 8),
-//                 IconButton(
-//                   icon: const Icon(Icons.send, color: const Color.fromARGB(255, 160, 195, 255)),
-//                   onPressed: _sendMessage,
-//                 ),
-//               ],
-//             ),
-//           ),
-//         ],
-//       ),
-//     );
-//   }
-// }
-
+  Endpoint({required this.id, required this.name});
+}
